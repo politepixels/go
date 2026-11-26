@@ -152,6 +152,15 @@ type Liveness struct {
 	// used only during liveness analysis for stack slot merging (doesn't
 	// make sense for stackmap analysis).
 	conservativeWrites bool
+
+	// derived holds, for each value ID, the index in vars of the variable
+	// that the value holds an address into, or a negative state. A use of
+	// the value reads the variable. See issue 82026.
+	derived []int32
+
+	// mixedAddr holds variables that some value may or may not hold an
+	// address into. Like address-taken variables, they get stack objects.
+	mixedAddr map[*ir.Name]bool
 }
 
 // Map maps from *ssa.Value to StackMapIndex.
@@ -453,6 +462,114 @@ func (lv *Liveness) blockEffects(b *ssa.Block) *blockEffects {
 	return &lv.be[b.ID]
 }
 
+// Negative states in lv.derived.
+const (
+	derivedNone    = -1 // holds no address into a variable
+	derivedUnknown = -2 // not known yet, in computeDerived
+	derivedMixed   = -3 // may or may not hold an address into a variable
+)
+
+// computeDerived fills in lv.derived and lv.mixedAddr.
+func (lv *Liveness) computeDerived() {
+	found := false
+	for _, b := range lv.f.Blocks {
+		for _, v := range b.Values {
+			found = found || lv.addrOf(v) >= 0
+		}
+	}
+	if !found {
+		return
+	}
+	d := make([]int32, lv.f.NumValues())
+	for i := range d {
+		d[i] = derivedUnknown
+	}
+	// A state only moves from unknown to a variable or none, and from
+	// there to mixed, so this terminates.
+	for changed := true; changed; {
+		changed = false
+		for _, b := range lv.f.Blocks {
+			for _, v := range b.Values {
+				if s := lv.derivedFrom(v, d); s != d[v.ID] {
+					d[v.ID] = s
+					changed = true
+				}
+			}
+		}
+	}
+	// Keeping a variable live at the uses of a mixed value could keep it
+	// live where it is not initialized. Give it a stack object instead.
+	for _, b := range lv.f.Blocks {
+		for _, v := range b.Values {
+			if d[v.ID] != derivedMixed {
+				continue
+			}
+			for i, a := range v.Args {
+				if pos := d[a.ID]; pos >= 0 && !v.AddrSinkArg(i) {
+					if lv.mixedAddr == nil {
+						lv.mixedAddr = make(map[*ir.Name]bool)
+					}
+					lv.mixedAddr[lv.vars[pos]] = true
+				}
+			}
+		}
+	}
+	lv.derived = d
+}
+
+// addrOf returns the index in vars of the variable that is not
+// address-taken and whose address v takes, or derivedNone.
+func (lv *Liveness) addrOf(v *ssa.Value) int32 {
+	if n, e := affectedVar(v); n != nil && e&ssaop.SymAddr != 0 && !n.Addrtaken() {
+		if pos, ok := lv.idx[n]; ok {
+			return pos
+		}
+	}
+	return derivedNone
+}
+
+// derivedFrom returns the state of v, given the states d of its arguments.
+func (lv *Liveness) derivedFrom(v *ssa.Value, d []int32) int32 {
+	if pos := lv.addrOf(v); pos >= 0 {
+		return pos
+	}
+	// Values of these types cannot hold an address.
+	t := v.Type
+	if t.IsMemory() || t.IsFlags() || t.IsVoid() || t.IsBoolean() || t.IsFloat() {
+		return derivedNone
+	}
+	s, unknown := int32(derivedUnknown), false
+	for i, a := range v.Args {
+		switch p := d[a.ID]; {
+		case v.AddrSinkArg(i), p == derivedNone && v.Op != ssaop.OpPhi:
+			// v does not hold a's address, or a is an index or offset.
+		case p == derivedUnknown:
+			unknown = true
+		case s == derivedUnknown || s == p:
+			s = p
+		default:
+			s = derivedMixed
+		}
+	}
+	if s == derivedUnknown && !unknown {
+		return derivedNone
+	}
+	return s
+}
+
+// addDerivedUses adds to live the variables that v reads through an
+// address into them. It skips phis, whose own uses keep them live.
+func (lv *Liveness) addDerivedUses(live bitvec.BitVec, v *ssa.Value) {
+	if lv.derived == nil || v.Op == ssaop.OpPhi {
+		return
+	}
+	for _, a := range v.Args {
+		if pos := lv.derived[a.ID]; pos >= 0 {
+			live.Set(pos)
+		}
+	}
+}
+
 // Generates live pointer value maps for arguments and local variables. The
 // this argument and the in arguments are always assumed live. The vars
 // argument is a slice of *Nodes.
@@ -716,6 +833,7 @@ func (lv *Liveness) prologue() {
 			if e&uevar != 0 {
 				be.uevar.Set(pos)
 			}
+			lv.addDerivedUses(be.uevar, b.Values[j])
 		}
 	}
 }
@@ -881,6 +999,7 @@ func (lv *Liveness) epilogue() {
 			if e&uevar != 0 {
 				liveout.Set(pos)
 			}
+			lv.addDerivedUses(liveout, v)
 		}
 
 		if b == lv.f.Entry {
@@ -1067,7 +1186,7 @@ func (lv *Liveness) clobber(b *ssa.Block) {
 // of b.Values.
 func clobber(lv *Liveness, b *ssa.Block, live bitvec.BitVec) {
 	for i, n := range lv.vars {
-		if !live.Get(int32(i)) && !n.Addrtaken() && !n.OpenDeferSlot() && !n.IsOutputParamHeapAddr() {
+		if !live.Get(int32(i)) && !n.Addrtaken() && !lv.mixedAddr[n] && !n.OpenDeferSlot() && !n.IsOutputParamHeapAddr() {
 			// Don't clobber stack objects (address-taken). They are
 			// tracked dynamically.
 			// Also don't clobber slots that are live for defers (see
@@ -1431,6 +1550,7 @@ func Compute(curfn *ir.Func, f *ssa.Func, stkptrsize int64, pp *objw.Progs, retL
 	// Construct the global liveness state.
 	vars, idx := getvariables(curfn)
 	lv := newliveness(curfn, f, vars, idx, stkptrsize)
+	lv.computeDerived()
 
 	// Run the dataflow framework.
 	lv.prologue()
@@ -1498,7 +1618,7 @@ func Compute(curfn *ir.Func, f *ssa.Func, stkptrsize int64, pp *objw.Progs, retL
 func (lv *Liveness) emitStackObjects() *obj.LSym {
 	var vars []*ir.Name
 	for _, n := range lv.fn.Dcl {
-		if shouldTrack(n) && n.Addrtaken() && n.Esc() != ir.EscHeap {
+		if shouldTrack(n) && (n.Addrtaken() || lv.mixedAddr[n]) && n.Esc() != ir.EscHeap {
 			vars = append(vars, n)
 		}
 	}
